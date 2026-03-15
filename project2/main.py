@@ -7,11 +7,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def get_openai_api_key():
+    if "OPENAI_API_KEY" in st.secrets:
+        return st.secrets["OPENAI_API_KEY"]
+    return os.getenv("OPENAI_API_KEY")
+
 
 st.set_page_config(page_title="AI Resume Critique", page_icon="📄", layout="centered")
 st.title("📄 AI Resume Critique")
 st.write("Upload your resume in PDF format, and I'll provide feedback to help you improve it.")
+
+api_key = get_openai_api_key()
+if not api_key:
+    st.error("Missing OpenAI API key. Set OPENAI_API_KEY in Streamlit Secrets.")
+    st.stop()
+
+client = OpenAI(api_key=api_key)
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
