@@ -8,41 +8,10 @@ from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 import certifi
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
-
-
-MOCK_DATA = [
-    {
-        "Posted": "2026-03-17 09:30 UTC",
-        "Company": "Google",
-        "Role": "Data Analyst",
-        "Location": "Remote",
-        "Tags": "Python, SQL",
-        "Apply URL": "https://example.com/google-role",
-    },
-    {
-        "Posted": "2026-03-16 15:10 UTC",
-        "Company": "Stripe",
-        "Role": "Backend Engineer",
-        "Location": "Remote - US",
-        "Tags": "API, Python",
-        "Apply URL": "https://example.com/stripe-role",
-    },
-    {
-        "Posted": "2026-03-15 12:45 UTC",
-        "Company": "Notion",
-        "Role": "Product Analyst",
-        "Location": "Hybrid",
-        "Tags": "Analytics, SQL",
-        "Apply URL": "https://example.com/notion-role",
-    },
-]
 
 DEFAULT_EMAIL_KEYWORDS = [
     "interview",
@@ -85,10 +54,50 @@ def save_feedback_rules(blocked_senders: list[str], blocked_keywords: list[str])
     FEEDBACK_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def sender_is_blocked(sender: str, sender_email: str, blocked_senders: list[str]) -> bool:
+    sender_lower = sender.strip().lower()
+    sender_email_lower = sender_email.strip().lower()
+    return any(blocked in sender_lower or blocked in sender_email_lower for blocked in blocked_senders)
+
+
+def apply_feedback_filters_to_email_df(
+    df: pd.DataFrame,
+    blocked_senders: list[str],
+    blocked_keywords: list[str],
+) -> pd.DataFrame:
+    if df.empty or "Subject" not in df.columns:
+        return df
+
+    filtered_df = df.copy()
+    from_values = filtered_df.get("From", pd.Series(dtype=str)).fillna("").astype(str)
+    from_email_values = filtered_df.get("From Email", pd.Series(dtype=str)).fillna("").astype(str)
+    snippet_values = filtered_df.get("Snippet", pd.Series(dtype=str)).fillna("").astype(str)
+
+    sender_mask = [
+        not sender_is_blocked(sender, sender_email, blocked_senders)
+        for sender, sender_email in zip(from_values.tolist(), from_email_values.tolist())
+    ]
+
+    if blocked_keywords:
+        keyword_mask = []
+        for subject, sender, sender_email, snippet in zip(
+            filtered_df["Subject"].fillna("").astype(str).tolist(),
+            from_values.tolist(),
+            from_email_values.tolist(),
+            snippet_values.tolist(),
+        ):
+            searchable = " ".join([subject, sender, sender_email, snippet]).lower()
+            keyword_mask.append(not any(blocked in searchable for blocked in blocked_keywords))
+    else:
+        keyword_mask = [True] * len(filtered_df)
+
+    return filtered_df[pd.Series(sender_mask, index=filtered_df.index) & pd.Series(keyword_mask, index=filtered_df.index)]
+
+
 def get_secret(name: str) -> str:
     try:
         return st.secrets.get(name, "")
-    except StreamlitSecretNotFoundError:
+    except Exception:
         return ""
 
 
@@ -187,9 +196,7 @@ def fetch_gmail_emails(
                 body_text = extract_message_text(message)
                 searchable = " ".join([subject, sender, sender_email, body_text]).lower()
 
-                sender_lower = sender.lower()
-                sender_email_lower = sender_email.lower()
-                if any(blocked in sender_lower or blocked in sender_email_lower for blocked in blocked_senders):
+                if sender_is_blocked(sender, sender_email, blocked_senders):
                     continue
                 if any(blocked in searchable for blocked in blocked_keywords):
                     continue
@@ -232,78 +239,15 @@ def fetch_gmail_emails(
     return matched_emails
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_live_jobs(search_term: str, days_to_scan: int, max_results: int) -> list[dict]:
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-    request = Request(
-        "https://remoteok.com/api",
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-        },
-    )
-
-    try:
-        with urlopen(request, timeout=20, context=ssl_context) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Unable to load live jobs: {exc}") from exc
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days_to_scan)
-    search_lower = search_term.strip().lower()
-    jobs = []
-
-    for item in payload:
-        if not isinstance(item, dict) or "id" not in item:
-            continue
-
-        epoch = item.get("epoch")
-        if not epoch:
-            continue
-
-        posted_at = datetime.fromtimestamp(epoch, tz=timezone.utc)
-        if posted_at < cutoff:
-            continue
-
-        company = item.get("company") or "Unknown"
-        role = item.get("position") or "Untitled role"
-        location = item.get("location") or "Remote"
-        tags = ", ".join(item.get("tags") or [])
-        apply_url = item.get("apply_url") or item.get("url") or ""
-
-        searchable = " ".join([company, role, location, tags]).lower()
-        if search_lower and search_lower not in searchable:
-            continue
-
-        jobs.append(
-            {
-                "Posted": posted_at.strftime("%Y-%m-%d %H:%M UTC"),
-                "Posted Timestamp": posted_at,
-                "Company": company,
-                "Role": role,
-                "Location": location,
-                "Tags": tags,
-                "Apply URL": apply_url,
-            }
-        )
-
-        if len(jobs) >= max_results:
-            break
-
-    return jobs
-
-
 st.set_page_config(page_title="Job Hunter AI", layout="wide")
 st.title("Job Search Intelligence")
-st.markdown("Test the dashboard with mock data, live remote job listings, or your Gmail inbox.")
+st.markdown("Scan and review relevant Gmail messages for your job search.")
 
 with st.sidebar:
     st.header("Controls")
-    data_source = st.radio("Data source", ["Gmail inbox", "Live jobs", "Mock data"], index=0)
     days_to_scan = st.slider("Scan the last X days", 1, 30, 7)
     max_results = st.slider("Max results", 10, 100, 25, step=5)
 
-    search_term = ""
     gmail_address = ""
     gmail_app_password = ""
     mailbox = "INBOX"
@@ -312,190 +256,187 @@ with st.sidebar:
     blocked_senders = feedback_rules["blocked_senders"]
     blocked_keywords = feedback_rules["blocked_keywords"]
 
-    if data_source == "Gmail inbox":
-        gmail_address = st.text_input("Gmail address", value=get_secret("gmail_address"), placeholder="name@gmail.com")
-        gmail_app_password = st.text_input(
-            "Gmail app password",
-            value=get_secret("gmail_app_password"),
-            type="password",
-            placeholder="16-character app password",
-        )
-        mailbox = st.selectbox("Mailbox", ["INBOX", "[Gmail]/All Mail"], index=0)
-        keyword_text = st.text_area(
-            "Relevant keywords (comma-separated)",
-            value=", ".join(DEFAULT_EMAIL_KEYWORDS),
-            help="Messages are included when the subject, sender, or body contains one of these terms.",
-        )
-        keywords = [keyword.strip().lower() for keyword in keyword_text.split(",") if keyword.strip()]
-        st.caption("Use a Gmail App Password. Regular account passwords will not work here.")
-        if blocked_senders or blocked_keywords:
-            st.caption(f"Active exclusions: {len(blocked_senders)} senders, {len(blocked_keywords)} keywords")
+    gmail_address = st.text_input("Gmail address", value=get_secret("gmail_address"), placeholder="name@gmail.com")
+    gmail_app_password = st.text_input(
+        "Gmail app password",
+        value=get_secret("gmail_app_password"),
+        type="password",
+        placeholder="16-character app password",
+    )
+    mailbox = st.selectbox("Mailbox", ["INBOX", "[Gmail]/All Mail"], index=0)
+    keyword_text = st.text_area(
+        "Relevant keywords (comma-separated)",
+        value=", ".join(DEFAULT_EMAIL_KEYWORDS),
+        help="Messages are included when the subject, sender, or body contains one of these terms.",
+    )
+    keywords = [keyword.strip().lower() for keyword in keyword_text.split(",") if keyword.strip()]
+    st.caption("Use a Gmail App Password. Regular account passwords will not work here.")
+    if blocked_senders or blocked_keywords:
+        st.caption(f"Active exclusions: {len(blocked_senders)} senders, {len(blocked_keywords)} keywords")
 
-        st.divider()
-        st.subheader("Improve matching")
-        st.caption("Flag senders or phrases as not relevant. Future Gmail scans will exclude similar emails.")
+    st.divider()
+    st.subheader("Improve matching")
+    st.caption("Flag senders or phrases as not relevant. Future Gmail scans will exclude similar emails.")
 
-        sender_option_map = {"": ""}
-        if "data" in st.session_state and st.session_state.get("data_source") == "Gmail inbox":
-            existing_df = pd.DataFrame(st.session_state.data)
-            if "From" in existing_df.columns or "From Email" in existing_df.columns:
-                from_values = existing_df.get("From", pd.Series(dtype=str)).fillna("").astype(str)
-                email_values = existing_df.get("From Email", pd.Series(dtype=str)).fillna("").astype(str)
+    sender_option_map = {"": ""}
+    if "data" in st.session_state:
+        existing_df = pd.DataFrame(st.session_state.data)
+        if "From" in existing_df.columns or "From Email" in existing_df.columns:
+            from_values = existing_df.get("From", pd.Series(dtype=str)).fillna("").astype(str)
+            email_values = existing_df.get("From Email", pd.Series(dtype=str)).fillna("").astype(str)
 
-                for sender_name, sender_email in zip(from_values.tolist(), email_values.tolist()):
-                    clean_name = sender_name.strip()
-                    clean_email = sender_email.strip()
-                    if not clean_name and not clean_email:
-                        continue
+            for sender_name, sender_email in zip(from_values.tolist(), email_values.tolist()):
+                clean_name = sender_name.strip()
+                clean_email = sender_email.strip()
+                if not clean_name and not clean_email:
+                    continue
 
-                    label = f"{clean_name} <{clean_email}>" if clean_email and clean_name else (clean_email or clean_name)
-                    value = (clean_email or clean_name).lower()
-                    sender_option_map[label] = value
+                label = f"{clean_name} <{clean_email}>" if clean_email and clean_name else (clean_email or clean_name)
+                value = (clean_email or clean_name).lower()
+                sender_option_map[label] = value
 
-        sender_options = sorted([option for option in sender_option_map.keys() if option])
+    sender_options = sorted([option for option in sender_option_map.keys() if option])
 
-        sender_to_block = st.selectbox(
-            "Flag sender as not relevant",
-            options=[""] + sender_options,
-            help="Run at least one Gmail scan to populate sender suggestions, or use the manual field below.",
-        )
-        sender_to_block_manual = st.text_input("Or type sender/email to block", placeholder="newsletter@example.com")
-        keyword_to_block = st.text_input("Flag phrase/keyword as not relevant", placeholder="e.g. newsletter")
+    sender_to_block = st.selectbox(
+        "Flag sender as not relevant",
+        options=[""] + sender_options,
+        help="Run at least one Gmail scan to populate sender suggestions, or use the manual field below.",
+    )
+    sender_to_block_manual = st.text_input("Or type sender/email to block", placeholder="newsletter@example.com")
+    keyword_to_block = st.text_input("Flag phrase/keyword as not relevant", placeholder="e.g. newsletter")
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Save sender flag", use_container_width=True):
-                selected_sender_value = sender_option_map.get(sender_to_block, sender_to_block).strip().lower()
-                chosen_sender = (sender_to_block_manual or selected_sender_value).strip().lower()
-                if not chosen_sender:
-                    st.warning("Choose or type a sender first.")
-                else:
-                    latest = load_feedback_rules()
-                    latest_senders = set(latest["blocked_senders"])
-                    latest_senders.add(chosen_sender)
-                    save_feedback_rules(list(latest_senders), latest["blocked_keywords"])
-                    st.success(f"Sender flagged: {chosen_sender}")
-                    st.rerun()
-        with col_b:
-            if st.button("Save keyword flag", use_container_width=True):
-                cleaned_term = keyword_to_block.strip().lower()
-                if not cleaned_term:
-                    st.warning("Enter a keyword first.")
-                else:
-                    latest = load_feedback_rules()
-                    latest_terms = set(latest["blocked_keywords"])
-                    latest_terms.add(cleaned_term)
-                    save_feedback_rules(latest["blocked_senders"], list(latest_terms))
-                    st.success(f"Keyword flagged: {cleaned_term}")
-                    st.rerun()
-
-        latest_rules = load_feedback_rules()
-        active_blocked_senders = latest_rules["blocked_senders"]
-        active_blocked_keywords = latest_rules["blocked_keywords"]
-
-        if active_blocked_senders:
-            to_remove_senders = st.multiselect(
-                "Remove sender flags",
-                options=active_blocked_senders,
-                default=[],
-            )
-            if st.button("Remove selected sender flags", use_container_width=True):
-                updated_senders = [s for s in active_blocked_senders if s not in set(to_remove_senders)]
-                save_feedback_rules(updated_senders, active_blocked_keywords)
-                st.success("Sender flags updated.")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Save sender flag", use_container_width=True):
+            selected_sender_value = sender_option_map.get(sender_to_block, sender_to_block).strip().lower()
+            chosen_sender = (sender_to_block_manual or selected_sender_value).strip().lower()
+            if not chosen_sender:
+                st.warning("Choose or type a sender first.")
+            else:
+                latest = load_feedback_rules()
+                latest_senders = set(latest["blocked_senders"])
+                latest_senders.add(chosen_sender)
+                save_feedback_rules(list(latest_senders), latest["blocked_keywords"])
+                st.success(f"Sender flagged: {chosen_sender}")
+                st.rerun()
+    with col_b:
+        if st.button("Save keyword flag", use_container_width=True):
+            cleaned_term = keyword_to_block.strip().lower()
+            if not cleaned_term:
+                st.warning("Enter a keyword first.")
+            else:
+                latest = load_feedback_rules()
+                latest_terms = set(latest["blocked_keywords"])
+                latest_terms.add(cleaned_term)
+                save_feedback_rules(latest["blocked_senders"], list(latest_terms))
+                st.success(f"Keyword flagged: {cleaned_term}")
                 st.rerun()
 
-        if active_blocked_keywords:
-            to_remove_keywords = st.multiselect(
-                "Remove keyword flags",
-                options=active_blocked_keywords,
-                default=[],
-            )
-            if st.button("Remove selected keyword flags", use_container_width=True):
-                updated_keywords = [k for k in active_blocked_keywords if k not in set(to_remove_keywords)]
-                save_feedback_rules(active_blocked_senders, updated_keywords)
-                st.success("Keyword flags updated.")
-                st.rerun()
-    elif data_source == "Live jobs":
-        search_term = st.text_input("Search title, company, location, or tag", "python")
+    latest_rules = load_feedback_rules()
+    active_blocked_senders = latest_rules["blocked_senders"]
+    active_blocked_keywords = latest_rules["blocked_keywords"]
+
+    if active_blocked_senders:
+        to_remove_senders = st.multiselect(
+            "Remove sender flags",
+            options=active_blocked_senders,
+            default=[],
+        )
+        if st.button("Remove selected sender flags", use_container_width=True):
+            updated_senders = [s for s in active_blocked_senders if s not in set(to_remove_senders)]
+            save_feedback_rules(updated_senders, active_blocked_keywords)
+            st.success("Sender flags updated.")
+            st.rerun()
+
+    if active_blocked_keywords:
+        to_remove_keywords = st.multiselect(
+            "Remove keyword flags",
+            options=active_blocked_keywords,
+            default=[],
+        )
+        if st.button("Remove selected keyword flags", use_container_width=True):
+            updated_keywords = [k for k in active_blocked_keywords if k not in set(to_remove_keywords)]
+            save_feedback_rules(active_blocked_senders, updated_keywords)
+            st.success("Keyword flags updated.")
+            st.rerun()
 
     if st.button("Load data", use_container_width=True):
-        if data_source == "Mock data":
-            st.session_state.data = MOCK_DATA
-            st.session_state.data_source = data_source
-        elif data_source == "Gmail inbox":
-            if not gmail_address or not gmail_app_password:
-                st.error("Enter your Gmail address and App Password to load email data.")
-            else:
-                with st.spinner("Scanning Gmail..."):
-                    try:
-                        st.session_state.data = fetch_gmail_emails(
-                            gmail_address,
-                            gmail_app_password,
-                            mailbox,
-                            days_to_scan,
-                            max_results,
-                            keywords,
-                            blocked_senders,
-                            blocked_keywords,
-                        )
-                        st.session_state.data_source = data_source
-                    except RuntimeError as exc:
-                        st.error(str(exc))
+        if not gmail_address or not gmail_app_password:
+            st.error("Enter your Gmail address and App Password to load email data.")
         else:
-            with st.spinner("Fetching live jobs..."):
+            with st.spinner("Scanning Gmail..."):
                 try:
-                    st.session_state.data = fetch_live_jobs(search_term, days_to_scan, max_results)
-                    st.session_state.data_source = data_source
+                    st.session_state.data = fetch_gmail_emails(
+                        gmail_address,
+                        gmail_app_password,
+                        mailbox,
+                        days_to_scan,
+                        max_results,
+                        keywords,
+                        blocked_senders,
+                        blocked_keywords,
+                    )
+                    st.session_state.data_source = "Gmail inbox"
                 except RuntimeError as exc:
                     st.error(str(exc))
 
 if "data" in st.session_state:
     df = pd.DataFrame(st.session_state.data)
+    df = apply_feedback_filters_to_email_df(df, blocked_senders, blocked_keywords)
 
     if df.empty:
-        if st.session_state.get("data_source") == "Gmail inbox":
-            st.warning("No Gmail messages matched the current keywords. Try fewer keywords, a wider date range, or the All Mail mailbox.")
-        else:
-            st.warning("No jobs matched the current filters. Try a broader search term or more days.")
+        st.warning("No Gmail messages matched the current keywords. Try fewer keywords, a wider date range, or the All Mail mailbox.")
     else:
         col1, col2, col3 = st.columns(3)
 
-        if "Received Timestamp" in df.columns:
-            recent_emails = (df["Received Timestamp"] >= datetime.now(timezone.utc) - timedelta(days=1)).sum()
-            col1.metric("Matched emails", len(df))
-            col2.metric("Unique senders", df["From Email"].replace("", pd.NA).dropna().nunique())
-            col3.metric("Received in 24h", recent_emails)
-        else:
-            recent_jobs = (df["Posted Timestamp"] >= datetime.now(timezone.utc) - timedelta(days=1)).sum()
-            col1.metric("Listings", len(df))
-            col2.metric("Companies", df["Company"].nunique())
-            col3.metric("Posted in 24h", recent_jobs)
+        recent_emails = (df["Received Timestamp"] >= datetime.now(timezone.utc) - timedelta(days=1)).sum()
+        col1.metric("Matched emails", len(df))
+        col2.metric("Unique senders", df["From Email"].replace("", pd.NA).dropna().nunique())
+        col3.metric("Received in 24h", recent_emails)
 
         st.divider()
-        st.subheader(f"Results ({st.session_state.get('data_source', 'Unknown source')})")
+        st.subheader("Results (Gmail inbox)")
 
-        if "Location" in df.columns:
-            locations = sorted(df["Location"].dropna().unique())
-            selected_locations = st.multiselect("Filter by location", options=locations, default=locations)
-            filtered_df = df[df["Location"].isin(selected_locations)].copy()
-        else:
-            senders = sorted(df["From"].dropna().unique())
-            selected_senders = st.multiselect("Filter by sender", options=senders, default=senders)
-            filtered_df = df[df["From"].isin(selected_senders)].copy()
+        senders = sorted(df["From"].dropna().unique())
+        selected_senders = st.multiselect("Filter by sender", options=senders, default=senders)
+        filtered_df = df[df["From"].isin(selected_senders)].copy()
 
         column_config = {}
-        if "Apply URL" in filtered_df.columns:
-            column_config["Apply URL"] = st.column_config.LinkColumn("Apply URL")
-
-        if "Posted Timestamp" in filtered_df.columns:
-            filtered_df = filtered_df.sort_values("Posted Timestamp", ascending=False)
-            filtered_df = filtered_df.drop(columns=["Posted Timestamp"])
 
         if "Received Timestamp" in filtered_df.columns:
             filtered_df = filtered_df.sort_values("Received Timestamp", ascending=False)
             filtered_df = filtered_df.drop(columns=["Received Timestamp"])
 
-        st.dataframe(filtered_df, use_container_width=True, column_config=column_config, hide_index=True)
+        editable_df = filtered_df.copy()
+        editable_df.insert(0, "Flag", False)
+        edited_df = st.data_editor(
+            editable_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                **column_config,
+                "Flag": st.column_config.CheckboxColumn("Flag", help="Check rows to block that sender."),
+            },
+            disabled=[column for column in editable_df.columns if column != "Flag"],
+            key="gmail_results_editor",
+        )
+
+        if st.button("Flag checked senders", use_container_width=True):
+            selected_rows = edited_df[edited_df["Flag"]]
+            senders_to_add = {
+                (row.get("From Email") or row.get("From") or "").strip().lower()
+                for _, row in selected_rows.iterrows()
+                if (row.get("From Email") or row.get("From") or "").strip()
+            }
+
+            if not senders_to_add:
+                st.warning("Check at least one sender row first.")
+            else:
+                latest = load_feedback_rules()
+                updated_senders = set(latest["blocked_senders"])
+                updated_senders.update(senders_to_add)
+                save_feedback_rules(list(updated_senders), latest["blocked_keywords"])
+                st.success(f"Flagged {len(senders_to_add)} sender(s).")
+                st.rerun()
 else:
-    st.write("Choose a data source in the sidebar, then click Load data.")
+    st.write("Enter your Gmail details in the sidebar, then click Load data.")
